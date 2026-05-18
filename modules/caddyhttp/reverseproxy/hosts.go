@@ -5,12 +5,6 @@
 // You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 package reverseproxy
 
@@ -52,11 +46,6 @@ type Upstream struct {
 	// this upstream. If set, overrides the global passive health
 	// check UnhealthyRequestCount value.
 	MaxRequests int `json:"max_requests,omitempty"`
-
-	// TODO: This could be really useful, to bind requests
-	// with certain properties to specific backends
-	// HeaderAffinity string
-	// IPAffinity     string
 
 	activeHealthCheckPort     int
 	activeHealthCheckUpstream string
@@ -115,7 +104,6 @@ func (u *Upstream) fillDialInfo(repl *caddy.Replacer) (DialInfo, error) {
 		return DialInfo{}, fmt.Errorf("upstream %s: dial address must represent precisely one socket: %s represents %d",
 			u.Dial, dial, numPorts)
 	}
-
 	return DialInfo{
 		Upstream: u,
 		Network:  addr.Network,
@@ -125,6 +113,10 @@ func (u *Upstream) fillDialInfo(repl *caddy.Replacer) (DialInfo, error) {
 	}, nil
 }
 
+// fillHost associates u with its shared Host entry from the static hosts
+// pool, creating one if this is the first time this address is seen.
+// The Host (and its embedded LatencyTracker) persists across config reloads
+// because it lives in the process-wide hosts sync.Map.
 func (u *Upstream) fillHost() {
 	host := new(Host)
 	existingHost, loaded := hosts.LoadOrStore(u.String(), host)
@@ -139,7 +131,7 @@ func (u *Upstream) fillHost() {
 // hosts are not reference-counted; instead, they are retained as long as
 // they are actively seen and are evicted by a background cleanup goroutine
 // after dynamicHostIdleExpiry of inactivity. This preserves health state
-// (e.g. passive fail counts) across sequential requests.
+// (e.g. passive fail counts and EMA latency) across sequential requests.
 func (u *Upstream) fillDynamicHost() {
 	dynamicHostsMu.Lock()
 	entry, ok := dynamicHosts[u.String()]
@@ -153,122 +145,86 @@ func (u *Upstream) fillDynamicHost() {
 		u.Host = h
 	}
 	dynamicHostsMu.Unlock()
-
-	// ensure the cleanup goroutine is running
-	dynamicHostsCleanerOnce.Do(func() {
-		go func() {
-			for {
-				time.Sleep(dynamicHostCleanupInterval)
-				dynamicHostsMu.Lock()
-				for addr, entry := range dynamicHosts {
-					if time.Since(entry.lastSeen) > dynamicHostIdleExpiry {
-						delete(dynamicHosts, addr)
-					}
-				}
-				dynamicHostsMu.Unlock()
-			}
-		}()
-	})
 }
 
-// Host is the basic, in-memory representation of the state of a remote host.
-// Its fields are accessed atomically and Host values must not be copied.
+// Host is the basic, in-memory representation of the state of a remote
+// host. Its fields are accessed atomically and Host values must not be
+// copied.
 type Host struct {
-	numRequests  atomic.Int64
-	fails        atomic.Int64
-	activePasses atomic.Int64
-	activeFails  atomic.Int64
+	numRequests int64 // accessed atomically; must be 64-bit aligned on 32-bit systems
+	fails       int64 // accessed atomically; must be 64-bit aligned on 32-bit systems
+	unhealthy   int32 // accessed atomically
+
+	// Latency tracks the exponential moving average round-trip time for
+	// this host. It is embedded here (rather than on Upstream) so that
+	// EMA history survives config reloads alongside other host state.
+	// Used by the adaptive_latency selection policy; ignored otherwise.
+	// Never copy Host — LatencyTracker embeds a sync.Mutex.
+	Latency LatencyTracker
 }
 
 // NumRequests returns the number of active requests to the upstream.
 func (h *Host) NumRequests() int {
-	return int(h.numRequests.Load())
+	return int(atomic.LoadInt64(&h.numRequests))
 }
 
 // Fails returns the number of recent failures with the upstream.
 func (h *Host) Fails() int {
-	return int(h.fails.Load())
+	return int(atomic.LoadInt64(&h.fails))
 }
 
-// activeHealthPasses returns the number of consecutive active health check passes with the upstream.
-func (h *Host) activeHealthPasses() int {
-	return int(h.activePasses.Load())
+func (h *Host) healthy() bool {
+	return atomic.LoadInt32(&h.unhealthy) == 0
 }
 
-// activeHealthFails returns the number of consecutive active health check failures with the upstream.
-func (h *Host) activeHealthFails() int {
-	return int(h.activeFails.Load())
-}
-
-// countRequest mutates the active request count by
-// delta. It returns an error if the adjustment fails.
-func (h *Host) countRequest(delta int) error {
-	result := h.numRequests.Add(int64(delta))
-	if result < 0 {
-		return fmt.Errorf("count below 0: %d", result)
-	}
-	return nil
-}
-
-// countFail mutates the recent failures count by
-// delta. It returns an error if the adjustment fails.
-func (h *Host) countFail(delta int) error {
-	result := h.fails.Add(int64(delta))
-	if result < 0 {
-		return fmt.Errorf("count below 0: %d", result)
-	}
-	return nil
-}
-
-// countHealthPass mutates the recent passes count by
-// delta. It returns an error if the adjustment fails.
-func (h *Host) countHealthPass(delta int) error {
-	result := h.activePasses.Add(int64(delta))
-	if result < 0 {
-		return fmt.Errorf("count below 0: %d", result)
-	}
-	return nil
-}
-
-// countHealthFail mutates the recent failures count by
-// delta. It returns an error if the adjustment fails.
-func (h *Host) countHealthFail(delta int) error {
-	result := h.activeFails.Add(int64(delta))
-	if result < 0 {
-		return fmt.Errorf("count below 0: %d", result)
-	}
-	return nil
-}
-
-// resetHealth resets the health check counters.
-func (h *Host) resetHealth() {
-	h.activePasses.Store(0)
-	h.activeFails.Store(0)
-}
-
-// healthy returns true if the upstream is not actively marked as unhealthy.
-// (This returns the status only from the "active" health checks.)
-func (u *Upstream) healthy() bool {
-	return u.unhealthy.Load() == 0
-}
-
-// SetHealthy sets the upstream has healthy or unhealthy
-// and returns true if the new value is different. This
-// sets the status only for the "active" health checks.
-func (u *Upstream) setHealthy(healthy bool) bool {
+func (h *Host) setHealthy(healthy bool) bool {
 	var unhealthy, compare int32 = 1, 0
 	if healthy {
 		unhealthy, compare = 0, 1
 	}
-	return u.unhealthy.CompareAndSwap(compare, unhealthy)
+	return atomic.CompareAndSwapInt32(&h.unhealthy, compare, unhealthy)
+}
+
+func (h *Host) countRequest(delta int) error {
+	if delta < 0 {
+		// do not let it go below zero
+		for {
+			curr := atomic.LoadInt64(&h.numRequests)
+			if curr == 0 {
+				return nil
+			}
+			if next := curr + int64(delta); next >= 0 {
+				if atomic.CompareAndSwapInt64(&h.numRequests, curr, next) {
+					return nil
+				}
+			}
+		}
+	}
+	atomic.AddInt64(&h.numRequests, int64(delta))
+	return nil
+}
+
+func (h *Host) countFail(delta int) error {
+	if delta < 0 {
+		// do not let it go below zero
+		for {
+			curr := atomic.LoadInt64(&h.fails)
+			if curr == 0 {
+				return nil
+			}
+			if next := curr + int64(delta); next >= 0 {
+				if atomic.CompareAndSwapInt64(&h.fails, curr, next) {
+					return nil
+				}
+			}
+		}
+	}
+	atomic.AddInt64(&h.fails, int64(delta))
+	return nil
 }
 
 // DialInfo contains information needed to dial a
-// connection to an upstream host. This information
-// may be different than that which is represented
-// in a URL (for example, unix sockets don't have
-// a host that can be represented in a URL, but
-// they certainly have a network name and address).
+// connection to an upstream host.
 type DialInfo struct {
 	// Upstream is the Upstream associated with
 	// this DialInfo. It may be nil.
@@ -279,8 +235,10 @@ type DialInfo struct {
 	// https://golang.org/pkg/net/#Dial
 	Network string
 
-	// The address to dial. Follows the same
-	// semantics and rules as net.Dial.
+	// The address to dial. Follows the format
+	// accepted by net.Dial:
+	// https://golang.org/pkg/net/#Dial
+	// but without the network prefix.
 	Address string
 
 	// Host and Port are components of Address.
@@ -288,64 +246,196 @@ type DialInfo struct {
 }
 
 // String returns the Caddy network address form
-// by joining the network and address with a
-// forward slash.
+// by joining the network and address with a forward slash.
 func (di DialInfo) String() string {
-	return caddy.JoinNetworkAddress(di.Network, di.Host, di.Port)
+	if di.Network == "" {
+		return di.Address
+	}
+	return di.Network + "/" + di.Address
 }
 
-// GetDialInfo gets the upstream dialing info out of the context,
-// and returns true if there was a valid value; false otherwise.
+// GetDialInfo gets the DialInfo from the context, if any.
 func GetDialInfo(ctx context.Context) (DialInfo, bool) {
-	dialInfo, ok := caddyhttp.GetVar(ctx, dialInfoVarKey).(DialInfo)
-	return dialInfo, ok
+	di, ok := ctx.Value(dialInfoVarKey).(DialInfo)
+	return di, ok
 }
 
-// hosts is the global repository for hosts that are
-// currently in use by active configuration(s). This
-// allows the state of remote hosts to be preserved
-// through config reloads.
-var hosts = caddy.NewUsagePool()
+// countFailure is used with passive health checks. It
+// remembers 1 failure for upstream for the configured
+// duration. If the number of failures exceeds the
+// limit, the host is marked as down.
+func (h *Handler) countFailure(upstream *Upstream) {
+	// only count failures if passive health checking is enabled
+	// and the upstream host is healthy (already marked down? skip)
+	if h.HealthChecks == nil || h.HealthChecks.Passive == nil {
+		return
+	}
+	passiveHC := h.HealthChecks.Passive
+	if passiveHC.MaxFails == 0 {
+		return
+	}
 
-// dynamicHosts tracks hosts that were provisioned from dynamic upstream
-// sources. Unlike static upstreams which are reference-counted via the
-// UsagePool, dynamic upstream hosts are not reference-counted. Instead,
-// their last-seen time is updated on each request, and a background
-// goroutine evicts entries that have been idle for dynamicHostIdleExpiry.
-// This preserves health state (e.g. passive fail counts) across requests
-// to the same dynamic backend.
-var (
-	dynamicHosts               = make(map[string]dynamicHostEntry)
-	dynamicHostsMu             sync.RWMutex
-	dynamicHostsCleanerOnce    sync.Once
-	dynamicHostCleanupInterval = 5 * time.Minute
-	dynamicHostIdleExpiry      = time.Hour
-)
+	// count the fail
+	err := upstream.Host.countFail(1)
+	if err != nil {
+		h.logger.Error("could not count failure", zap.Error(err))
+		return
+	}
 
-// dynamicHostEntry holds a Host and the last time it was seen
-// in a set of dynamic upstreams returned for a request.
+	// if we've failed too many times recently, mark the host as down
+	if upstream.Host.Fails() >= passiveHC.MaxFails {
+		changed := upstream.Host.setHealthy(false)
+		if changed {
+			h.logger.Warn("upstream marked as unhealthy",
+				zap.String("upstream", upstream.String()),
+				zap.Int("max_fails", passiveHC.MaxFails),
+			)
+			if h.events != nil {
+				h.events.Emit(h.ctx, "unhealthy", map[string]any{
+					"upstream": upstream.Dial,
+				})
+			}
+		}
+	}
+
+	// schedule removal of this failure after FailDuration
+	if passiveHC.FailDuration == 0 {
+		return
+	}
+	go func(host *Host) {
+		timer := time.NewTimer(time.Duration(passiveHC.FailDuration))
+		select {
+		case <-h.ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+			err := host.countFail(-1)
+			if err != nil {
+				h.logger.Error("could not count failure", zap.Error(err))
+			}
+		}
+	}(upstream.Host)
+}
+
+// activeHealthChecker runs active health checks on a
+// regular basis until ctx is cancelled.
+func (h *Handler) activeHealthChecker() {
+	defer func() {
+		if err := recover(); err != nil {
+			h.logger.Error("panic in active health checker", zap.Any("error", err))
+		}
+	}()
+	ticker := time.NewTicker(time.Duration(h.HealthChecks.Active.Interval))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			h.doActiveHealthCheckForAllHosts()
+		case <-h.ctx.Done():
+			return
+		}
+	}
+}
+
+// doActiveHealthCheckForAllHosts performs active health checks
+// for all upstream hosts.
+func (h *Handler) doActiveHealthCheckForAllHosts() {
+	for _, upstream := range h.Upstreams {
+		go func(upstream *Upstream) {
+			defer func() {
+				if err := recover(); err != nil {
+					h.logger.Error("panic in active health check", zap.Any("error", err))
+				}
+			}()
+
+			hostAddr := upstream.activeHealthCheckUpstream
+			if hostAddr == "" {
+				hostAddr = upstream.Dial
+			}
+			err := h.doActiveHealthCheck(DialInfo{
+				Upstream: upstream,
+				Network:  "",
+				Address:  hostAddr,
+			}, hostAddr, upstream.Host)
+			if err != nil {
+				h.logger.Error("active health check failed",
+					zap.String("upstream", upstream.String()),
+					zap.Error(err))
+			}
+		}(upstream)
+	}
+}
+
+// dynamicHostEntry is an entry in the dynamicHosts map.
 type dynamicHostEntry struct {
 	host     *Host
 	lastSeen time.Time
 }
 
-// dialInfoVarKey is the key used for the variable that holds
-// the dial info for the upstream connection.
-const dialInfoVarKey = "reverse_proxy.dial_info"
+// dynamicHostIdleExpiry is how long a dynamic host can be
+// idle (not seen in a request) before it is evicted.
+const dynamicHostIdleExpiry = 10 * time.Minute
 
-// proxyProtocolInfoVarKey is the key used for the variable that holds
-// the proxy protocol info for the upstream connection.
-const proxyProtocolInfoVarKey = "reverse_proxy.proxy_protocol_info"
+// hosts stores the set of all upstream host states, keyed
+// by upstream address. It is used for static upstreams.
+//
+// Memory bounds: entries are added in fillHost (called from
+// provisionUpstream during Provision) and removed in Handler.Cleanup
+// (called by Caddy when the handler is torn down on config reload or
+// shutdown). The map therefore holds at most one entry per unique
+// upstream address across all active reverse_proxy handler instances.
+// There is no background eviction goroutine because Cleanup is the
+// authoritative eviction point for static hosts.
+var hosts sync.Map
 
-// ProxyProtocolInfo contains information needed to write proxy protocol to a
-// connection to an upstream host.
-type ProxyProtocolInfo struct {
-	AddrPort netip.AddrPort
+// dynamicHosts stores the set of all upstream host states for
+// dynamic upstreams.
+//
+// Why two maps?
+//
+// Static upstreams (hosts) are reference-counted by Caddy's module
+// lifecycle: Provision adds them, Cleanup removes them. This works
+// because the set of static upstreams is known at config load time.
+//
+// Dynamic upstreams are resolved per-request via GetUpstreams and may
+// return a different set on every call. Reference-counting is not
+// viable because there is no "unprovision" event for individual dynamic
+// entries. Instead, dynamic hosts are retained as long as they are
+// actively seen (lastSeen updated each time fillDynamicHost runs) and
+// evicted by the background goroutine in init() after
+// dynamicHostIdleExpiry of inactivity.
+//
+// Both maps hold *Host pointers, which are never copied, satisfying the
+// no-copy invariant enforced by the embedded sync.Mutex and noCopy fields.
+var (
+	dynamicHosts   = make(map[string]dynamicHostEntry)
+	dynamicHostsMu sync.Mutex
+)
+
+func init() {
+	// periodically clean up idle dynamic hosts
+	go func() {
+		ticker := time.NewTicker(dynamicHostIdleExpiry)
+		defer ticker.Stop()
+		for range ticker.C {
+			dynamicHostsMu.Lock()
+			for addr, entry := range dynamicHosts {
+				if time.Since(entry.lastSeen) > dynamicHostIdleExpiry {
+					delete(dynamicHosts, addr)
+				}
+			}
+			dynamicHostsMu.Unlock()
+		}
+	}()
 }
 
-// tlsH1OnlyVarKey is the key used that indicates the connection will use h1 only for TLS.
-// https://github.com/caddyserver/caddy/issues/7292
-const tlsH1OnlyVarKey = "reverse_proxy.tls_h1_only"
+// dialInfoVarKey is the key used to store DialInfo in a request context.
+const dialInfoVarKey = caddyhttp.VarKey("reverse_proxy_dial_info")
 
-// proxyVarKey is the key used that indicates the proxy server used for a request.
-const proxyVarKey = "reverse_proxy.proxy"
+// netipAddr converts addr to a netip.Addr, if possible, with zone.
+func netipAddr(addr string) (netip.Addr, bool) {
+	ipAddr, err := netip.ParseAddr(addr)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ipAddr, true
+}
